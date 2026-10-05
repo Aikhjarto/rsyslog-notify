@@ -1,0 +1,579 @@
+#!/usr/bin/python3
+# rsyslog-notify - batch rsyslog messages from omprog and send them via XMPP (go-sendxmpp) and mail
+#
+# Copyright (C) 2026 Thomas Wagner <wagner-thomas@gmx.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Read the messages rsyslog's omprog writes to stdin, one per line, keep
+those that pass the severity and the include and exclude rules in a buffer,
+and send the buffer via go-sendxmpp and optionally by mail: after a number of
+lines, a number of seconds after the first buffered line, when the pipe is
+closed, and on SIGTERM, SIGINT or SIGUSR1.
+"""
+
+import argparse
+import datetime
+import email.message
+import email.utils
+import json
+import os
+import re
+import select
+import signal
+import smtplib
+import socket
+import subprocess
+import sys
+import time
+
+VERSION = "0.1"
+
+LEVELS = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
+LEVEL_ALIASES = {"emergency": 0, "panic": 0, "critical": 2, "error": 3, "warn": 4, "informational": 6}
+FACILITIES = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp",
+              "ntp", "security", "console", "clock"] + ["local%d" % n for n in range(8)]
+
+DEFAULTS = {
+    "priority": "warning",
+    "include": [],
+    "exclude": [],
+    "max_lines": 20,
+    "interval": 300,
+    "max_buffer": 1000,
+    "format": "auto",
+    "confirm": False,
+    "subject": "[rsyslog] {host}: {count} message(s)",
+    "xmpp": {"to": [], "chatroom": False, "config": None, "go_sendxmpp": "go-sendxmpp", "args": [],
+             "timeout": 60},
+    "mail": {"to": [], "from": None, "method": "smtp", "host": "localhost", "port": 25,
+             "sendmail": "/usr/sbin/sendmail"},
+}
+
+
+class NotifyError(Exception):
+    pass
+
+
+def warn(text):
+    sys.stderr.write("rsyslog-notify: %s\n" % text)
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# severities and messages
+# ---------------------------------------------------------------------------
+
+def parse_level(text):
+    value = str(text).strip().lower()
+    if value.isdigit() and int(value) <= 7:
+        return int(value)
+    if value in LEVELS:
+        return LEVELS.index(value)
+    if value in LEVEL_ALIASES:
+        return LEVEL_ALIASES[value]
+    raise ValueError("unknown severity %r" % text)
+
+
+def parse_priority(text):
+    """The levels journalctl -p selects: LEVEL and everything more severe, or FROM..TO."""
+    value = str(text)
+    if ".." in value:
+        first, last = (parse_level(part) for part in value.split("..", 1))
+        return frozenset(range(min(first, last), max(first, last) + 1))
+    return frozenset(range(0, parse_level(value) + 1))
+
+
+class Message:
+    __slots__ = ("time", "host", "program", "pid", "facility", "severity", "message")
+
+    def __init__(self, time, host, program, pid, facility, severity, message):
+        self.time = time
+        self.host = host
+        self.program = program
+        self.pid = pid
+        self.facility = facility
+        self.severity = severity
+        self.message = message
+
+
+def rfc3339(text):
+    text = text.strip().replace("Z", "+00:00")
+    match = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?([+-]\d\d):?(\d\d)$", text)
+    if not match:
+        raise ValueError(text)
+    head, fraction, hours, minutes = match.groups()
+    return datetime.datetime.fromisoformat("%s%s%s:%s" % (head, (fraction or ".0")[:7], hours, minutes)).timestamp()
+
+
+def from_pri(pri):
+    pri = int(pri)
+    facility = pri >> 3
+    return (FACILITIES[facility] if facility < len(FACILITIES) else str(facility)), pri & 7
+
+
+def parse_json(line, received):
+    """rsyslog's %jsonmesg% property."""
+    data = json.loads(line)
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    severity = data.get("syslogseverity")
+    facility = data.get("syslogfacility-text")
+    if severity is None and data.get("pri") is not None:
+        facility_name, severity = from_pri(data["pri"])
+        facility = facility or facility_name
+    try:
+        stamp = rfc3339(data["timereported"]) if data.get("timereported") else received
+    except ValueError:
+        stamp = received
+    procid = str(data.get("procid") or "")
+    return Message(stamp, data.get("hostname") or data.get("fromhost") or "",
+                   data.get("programname") or data.get("app-name") or "",
+                   "" if procid == "-" else procid, facility or "",
+                   int(severity) if severity is not None else None, str(data.get("msg", "")).strip())
+
+
+RFC5424_RE = re.compile(r"^<(\d{1,3})>1 (\S+) (\S+) (\S+) (\S+) \S+ (?:-|(?:\[(?:[^\]\\]|\\.)*\])+) ?(.*)$")
+RFC3164_RE = re.compile(r"^<(\d{1,3})>(?:([A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) )?"
+                        r"(\S+) ([^\s\[:]+)(?:\[(\d+)\])?: ?(.*)$")
+
+
+def parse_syslog(line, received):
+    """RFC 5424 (RSYSLOG_SyslogProtocol23Format) or <PRI> with a BSD header (RSYSLOG_ForwardFormat style)."""
+    match = RFC5424_RE.match(line)
+    if match:
+        pri, stamp, host, app, procid, message = match.groups()
+        facility, severity = from_pri(pri)
+        try:
+            when = rfc3339(stamp)
+        except ValueError:
+            when = received
+        if message.startswith("\ufeff"):
+            message = message[1:]
+        return Message(when, "" if host == "-" else host, "" if app == "-" else app,
+                       "" if procid == "-" else procid, facility, severity, message)
+    match = RFC3164_RE.match(line)
+    if match:
+        pri, stamp, host, program, pid, message = match.groups()
+        facility, severity = from_pri(pri)
+        when = received
+        if stamp and stamp[0].isdigit():     # RSYSLOG_ForwardFormat has an RFC 3339 time stamp
+            try:
+                when = rfc3339(stamp)
+            except ValueError:
+                pass
+        return Message(when, host, program, pid or "", facility, severity, message)
+    return None
+
+
+def parse_line(line, received, fmt):
+    line = line.rstrip("\r\n")
+    if not line.strip():
+        return None
+    if fmt in ("auto", "json") and line.lstrip().startswith("{"):
+        try:
+            return parse_json(line, received)
+        except ValueError:
+            if fmt == "json":
+                raise
+    if fmt in ("auto", "syslog"):
+        message = parse_syslog(line, received)
+        if message is not None:
+            return message
+    # a line without a recognized format: its severity is unknown
+    return Message(received, "", "", "", "", None, line)
+
+
+# ---------------------------------------------------------------------------
+# filters
+# ---------------------------------------------------------------------------
+
+RULE_FIELDS = {"host": "host", "hostname": "host", "program": "program", "source": "program",
+               "tag": "program", "facility": "facility", "message": "message", "content": "message",
+               "msg": "message"}
+
+
+class Rule:
+    def __init__(self, conditions, text):
+        self.conditions = conditions
+        self.text = text
+
+    def matches(self, message):
+        return all(regex.search(getattr(message, field) or "") for field, regex in self.conditions)
+
+
+def parse_rule(value):
+    """A rule from YAML (fields to regular expressions) or the command line (FIELD=REGEX)."""
+    if isinstance(value, str):
+        field, sep, regex = value.partition("=")
+        if not sep:
+            raise ValueError("a rule is FIELD=REGEX, not %r" % value)
+        value = {field.strip(): regex}
+    if not isinstance(value, dict) or not value:
+        raise ValueError("a rule needs at least one of %s" % ", ".join(sorted(set(RULE_FIELDS.values()))))
+    conditions = []
+    for field, regex in value.items():
+        name = RULE_FIELDS.get(str(field).strip().lower())
+        if name is None:
+            raise ValueError("unknown field %r in rule, use %s" % (field, ", ".join(sorted(set(RULE_FIELDS.values())))))
+        try:
+            conditions.append((name, re.compile(str(regex))))
+        except re.error as err:
+            raise ValueError("invalid regular expression %r: %s" % (regex, err))
+    return Rule(conditions, ", ".join("%s=%s" % item for item in value.items()))
+
+
+def selected(message, levels, include, exclude):
+    if any(rule.matches(message) for rule in exclude):
+        return False
+    if any(rule.matches(message) for rule in include):
+        return True
+    return message.severity is not None and message.severity in levels
+
+
+# ---------------------------------------------------------------------------
+# sending
+# ---------------------------------------------------------------------------
+
+def format_time(seconds):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(seconds))
+
+
+def compose(messages, dropped, config, local_host):
+    hosts = sorted({message.host or local_host for message in messages})
+    subject = config["subject"].format(host=", ".join(hosts) if len(hosts) <= 3 else "%d hosts" % len(hosts),
+                                       count=len(messages) + dropped)
+    lines = []
+    if dropped:
+        lines.append("%d older message(s) were dropped, the buffer was full" % dropped)
+    for message in messages:
+        program = message.program + ("[%s]" % message.pid if message.pid else "")
+        level = LEVELS[message.severity] if message.severity is not None else "?"
+        lines.append("%s %s %s %s: %s" % (format_time(message.time), message.host or local_host, program or "?",
+                                          level, message.message))
+    return subject, "\n".join(lines) + "\n"
+
+
+def send_xmpp(config, subject, body):
+    command = [config["go_sendxmpp"]]
+    if config.get("config"):
+        command += ["-f", config["config"]]
+    if config.get("chatroom"):
+        command.append("-c")
+    command += [str(arg) for arg in config.get("args") or []] + list(config["to"])
+    try:
+        result = subprocess.run(command, input=(subject + "\n\n" + body).encode("utf-8"), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=float(config.get("timeout", 60)))
+    except OSError as err:
+        raise NotifyError("cannot run %s: %s" % (config["go_sendxmpp"], err.strerror))
+    except subprocess.TimeoutExpired:
+        raise NotifyError("%s did not finish in time" % config["go_sendxmpp"])
+    if result.returncode != 0:
+        raise NotifyError("%s failed: %s" % (config["go_sendxmpp"],
+                                                result.stderr.decode("utf-8", "replace").strip() or result.returncode))
+
+
+def send_mail(config, subject, body, local_host):
+    message = email.message.EmailMessage()
+    message["From"] = config.get("from") or "rsyslog-notify@%s" % local_host
+    message["To"] = ", ".join(config["to"])
+    message["Subject"] = subject
+    message["Date"] = email.utils.formatdate(localtime=True)
+    message["Message-ID"] = email.utils.make_msgid(domain=local_host)
+    message["Auto-Submitted"] = "auto-generated"
+    message.set_content(body)
+    if config.get("method", "smtp") == "sendmail":
+        try:
+            result = subprocess.run([config["sendmail"], "-t", "-oi"], input=message.as_bytes(),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as err:
+            raise NotifyError("cannot run %s: %s" % (config["sendmail"], err))
+        if result.returncode != 0:
+            raise NotifyError("%s failed: %s" % (config["sendmail"], result.stderr.decode("utf-8", "replace").strip()))
+        return
+    try:
+        with smtplib.SMTP(config.get("host", "localhost"), int(config.get("port", 25)), timeout=60) as smtp:
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as err:
+        raise NotifyError("cannot send mail via %s:%s: %s" % (config.get("host"), config.get("port"), err))
+
+
+# ---------------------------------------------------------------------------
+# the buffer
+# ---------------------------------------------------------------------------
+
+class Buffer:
+    """Messages waiting to be sent; each destination keeps what it could not send yet."""
+
+    def __init__(self, config, local_host):
+        self.config = config
+        self.local_host = local_host
+        self.destinations = []
+        if config["xmpp"].get("to"):
+            self.destinations.append("xmpp")
+        if config["mail"].get("to"):
+            self.destinations.append("mail")
+        self.pending = {name: [] for name in self.destinations}
+        self.dropped = {name: 0 for name in self.destinations}
+        self.first = None          # when the oldest unsent message arrived
+        self.retry_at = 0.0
+        self.failures = 0
+        self.max_buffer = int(config["max_buffer"])
+
+    def add(self, message):
+        for name in self.destinations:
+            pending = self.pending[name]
+            pending.append(message)
+            if len(pending) > self.max_buffer:
+                del pending[0]
+                self.dropped[name] += 1
+        if self.first is None:
+            self.first = time.monotonic()
+
+    def size(self):
+        return max((len(pending) for pending in self.pending.values()), default=0)
+
+    def due(self, now):
+        """Whether to send now, and how long the main loop may wait otherwise."""
+        if not self.size():
+            return False, None
+        if now < self.retry_at:
+            return False, self.retry_at - now
+        if self.size() >= int(self.config["max_lines"]):
+            return True, 0
+        deadline = self.first + float(self.config["interval"])
+        return now >= deadline, max(0.0, deadline - now)
+
+    def flush(self):
+        """Send what is pending; returns False if a destination failed and keeps its messages."""
+        failed = False
+        for name in self.destinations:
+            messages = self.pending[name]
+            if not messages and not self.dropped[name]:
+                continue
+            subject, body = compose(messages, self.dropped[name], self.config, self.local_host)
+            try:
+                if name == "xmpp":
+                    send_xmpp(self.config["xmpp"], subject, body)
+                else:
+                    send_mail(self.config["mail"], subject, body, self.local_host)
+            except NotifyError as err:
+                warn("%s: %s; %d message(s) kept" % (name, err, len(messages)))
+                failed = True
+                continue
+            self.pending[name] = []
+            self.dropped[name] = 0
+        if failed:
+            self.failures += 1
+            self.retry_at = time.monotonic() + min(30 * 2 ** (self.failures - 1), 3600)
+        else:
+            self.failures = 0
+            self.retry_at = 0.0
+            self.first = None
+        if self.size() == 0:
+            self.first = None
+        return not failed
+
+
+# ---------------------------------------------------------------------------
+# the main loop
+# ---------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self, config, stdin=None, stdout=None):
+        self.config = config
+        self.levels = parse_priority(config["priority"])
+        self.include = [parse_rule(rule) for rule in config.get("include") or []]
+        self.exclude = [parse_rule(rule) for rule in config.get("exclude") or []]
+        self.format = str(config.get("format", "auto")).lower()
+        if self.format not in ("auto", "json", "syslog", "text"):
+            raise NotifyError("format is auto, json, syslog or text, not %r" % config.get("format"))
+        self.buffer = Buffer(config, socket.getfqdn())
+        if not self.buffer.destinations:
+            raise NotifyError("no recipients: set xmpp: to and/or mail: to")
+        self.stdin = stdin if stdin is not None else sys.stdin.buffer
+        self.stdout = stdout if stdout is not None else sys.stdout
+        self.confirm = bool(config.get("confirm"))
+        self.stopping = False
+        self.flush_requested = False
+        self.partial = b""
+
+    def acknowledge(self):
+        # omprog with confirmMessages="on" waits for OK at start and after every message
+        if self.confirm:
+            self.stdout.write("OK\n")
+            self.stdout.flush()
+
+    def handle(self, raw):
+        text = raw.decode("utf-8", "replace")
+        if self.format == "text":
+            text = text.rstrip("\r\n")
+            message = Message(time.time(), "", "", "", "", None, text) if text.strip() else None
+        else:
+            try:
+                message = parse_line(text, time.time(), self.format)
+            except ValueError as err:
+                warn("cannot parse %r: %s" % (text[:200], err))
+                message = None
+        if message is not None and selected(message, self.levels, self.include, self.exclude):
+            self.buffer.add(message)
+        self.acknowledge()
+
+    def run(self):
+        # a signal handler only sets a flag; the wakeup pipe makes select() return so the loop sees it
+        wake_read, wake_write = os.pipe()
+        os.set_blocking(wake_read, False)
+        os.set_blocking(wake_write, False)
+        old_wakeup = signal.set_wakeup_fd(wake_write)
+        handlers = {signum: signal.signal(signum, handler) for signum, handler in
+                    ((signal.SIGTERM, self.stop), (signal.SIGINT, self.stop), (signal.SIGUSR1, self.request_flush))}
+        try:
+            return self.loop(wake_read)
+        finally:
+            signal.set_wakeup_fd(old_wakeup)
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+            os.close(wake_read)
+            os.close(wake_write)
+
+    def loop(self, wake_read):
+        self.acknowledge()
+        fd = self.stdin.fileno()
+        while not self.stopping:
+            due, wait = self.buffer.due(time.monotonic())
+            if due or self.flush_requested:
+                self.flush_requested = False
+                self.buffer.flush()
+                continue
+            ready, _, _ = select.select([fd, wake_read], [], [], wait)
+            if wake_read in ready:
+                try:
+                    os.read(wake_read, 512)
+                except BlockingIOError:
+                    pass
+            if fd not in ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            self.partial += chunk
+            while b"\n" in self.partial:
+                line, self.partial = self.partial.split(b"\n", 1)
+                self.handle(line)
+                if self.buffer.due(time.monotonic())[0]:
+                    self.buffer.flush()
+        if self.partial.strip():
+            self.handle(self.partial)
+            self.partial = b""
+        # the pipe was closed or we were asked to stop: send what is left, once
+        if self.buffer.size() or any(self.buffer.dropped.values()):
+            self.buffer.retry_at = 0.0
+            if not self.buffer.flush():
+                warn("%d message(s) could not be sent before exiting" % self.buffer.size())
+                return 1
+        return 0
+
+    def stop(self, signum, frame):
+        self.stopping = True
+
+    def request_flush(self, signum, frame):
+        self.flush_requested = True
+
+
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
+
+def merge_config(base, override):
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_yaml(path):
+    try:
+        import yaml
+    except ImportError:
+        raise NotifyError("reading %s needs PyYAML (python3-PyYAML / python3-yaml)" % path)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError as err:
+        raise NotifyError("cannot read %s: %s" % (path, err.strerror))
+    except yaml.YAMLError as err:
+        raise NotifyError("invalid YAML in %s: %s" % (path, err))
+    if not isinstance(data, dict):
+        raise NotifyError("%s must contain a mapping" % path)
+    return data
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="rsyslog-notify",
+        description="Read the messages rsyslog's omprog writes to stdin, keep those that pass the filters, and "
+                    "send them in batches via go-sendxmpp and optionally by mail.",
+        epilog="A batch is sent after --max-lines messages, --interval seconds after its first message, when the "
+               "pipe is closed, and on SIGTERM, SIGINT or SIGUSR1. Options here override the configuration file.")
+    parser.add_argument("-V", "--version", action="version", version="rsyslog-notify %s" % VERSION)
+    parser.add_argument("-C", "--config", help="YAML configuration file")
+    parser.add_argument("-p", "--priority",
+                        help="severity like journalctl -p: a level and all more severe ones, or FROM..TO "
+                             "(default: warning)")
+    parser.add_argument("--include", action="append", metavar="FIELD=REGEX",
+                        help="forward messages that match, whatever their severity; FIELD is host, program, "
+                             "facility or message; repeatable")
+    parser.add_argument("--exclude", action="append", metavar="FIELD=REGEX",
+                        help="leave out messages that match; repeatable")
+    parser.add_argument("-n", "--max-lines", type=int, help="send after this many messages (default: 20)")
+    parser.add_argument("-s", "--interval", type=float,
+                        help="send this many seconds after the first buffered message (default: 300)")
+    parser.add_argument("--format", choices=("auto", "json", "syslog", "text"),
+                        help="input: rsyslog's %%jsonmesg%%, RFC 5424 or <PRI> syslog lines, or plain text "
+                             "(default: auto)")
+    parser.add_argument("--confirm", action="store_true",
+                        help="answer OK to every message, for omprog's confirmMessages=\"on\"")
+    parser.add_argument("--xmpp-to", action="append", metavar="JID", help="XMPP recipient; repeatable")
+    parser.add_argument("--xmpp-config", help="go-sendxmpp configuration file")
+    parser.add_argument("--mail-to", action="append", metavar="ADDRESS", help="mail recipient; repeatable")
+    return parser
+
+
+def load_config(args):
+    config = merge_config(DEFAULTS, load_yaml(args.config)) if args.config else merge_config(DEFAULTS, {})
+    for key, value in (("priority", args.priority), ("max_lines", args.max_lines), ("interval", args.interval),
+                       ("format", args.format)):
+        if value is not None:
+            config[key] = value
+    if args.confirm:
+        config["confirm"] = True
+    if args.include:
+        config["include"] = list(config.get("include") or []) + args.include
+    if args.exclude:
+        config["exclude"] = list(config.get("exclude") or []) + args.exclude
+    if args.xmpp_to:
+        config["xmpp"] = dict(config["xmpp"], to=args.xmpp_to)
+    if args.xmpp_config:
+        config["xmpp"] = dict(config["xmpp"], config=args.xmpp_config)
+    if args.mail_to:
+        config["mail"] = dict(config["mail"], to=args.mail_to)
+    for section in ("xmpp", "mail"):
+        if isinstance(config[section].get("to"), str):
+            config[section] = dict(config[section], to=[config[section]["to"]])
+    return config
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        config = load_config(args)
+        daemon = Daemon(config)
+    except (NotifyError, ValueError) as err:
+        warn(str(err))
+        return 2
+    return daemon.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

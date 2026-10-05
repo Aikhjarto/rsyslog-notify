@@ -1,0 +1,47 @@
+# rsyslog-notify configuration; options on the command line override it.
+
+# Severities to forward, like journalctl -p: a level and all more severe
+# ones (emerg alert crit err warning notice info debug), or FROM..TO.
+priority: warning
+
+# Rules: each is a mapping of fields to regular expressions (Python re,
+# re.search), all of which must match. Fields: host, program, facility,
+# message. exclude wins over include; include forwards whatever the severity.
+include:
+  - {program: '^sshd$', message: 'Accepted \S+ for root'}
+exclude:
+  - {host: '^printer', program: '^snmpd$'}
+  - {message: 'Connection reset by peer'}
+
+# A batch is sent after max_lines messages, interval seconds after its first
+# message, when rsyslog closes the pipe, and on SIGTERM, SIGINT or SIGUSR1.
+max_lines: 20
+interval: 300
+# Messages kept per destination while it fails; the oldest are dropped.
+max_buffer: 1000
+
+# Input: auto, json (template with %jsonmesg%), syslog (RFC 5424 or
+# <PRI> lines like RSYSLOG_ForwardFormat), text (no severity: only include
+# rules select).
+format: auto
+# Answer OK per message, for omprog's confirmMessages="on".
+confirm: false            # --confirm in data/rsyslog-notify.conf sets it
+
+# {host} and {count} are replaced; the first line of an XMPP message.
+subject: "[rsyslog] {host}: {count} message(s)"
+
+xmpp:
+  to: [admin@example.org]
+  # chatroom: true          # the recipients are MUCs (go-sendxmpp -c)
+  config: /etc/rsyslog-notify/sendxmpp.conf
+  go_sendxmpp: go-sendxmpp
+  args: []                  # e.g. [--timeout, "30"]
+  timeout: 60
+
+mail:
+  to: []                    # e.g. [root@localhost]
+  # from: rsyslog-notify@example.org
+  method: smtp              # or sendmail
+  host: localhost
+  port: 25
+  # sendmail: /usr/sbin/sendmail
